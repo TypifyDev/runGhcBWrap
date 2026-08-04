@@ -36,10 +36,10 @@ import qualified Data.Text as T
 
 -- runghc = $(staticWhich "runghc")
 -- ghc = $(staticWhich "ghc")
-runghc912 = $(staticWhich "runghc-9.12.2")
-ghc912 = $(staticWhich "ghc-9.12.2")
+runghc912 = $(staticWhich "runghc-9.14.1")
+ghc912 = $(staticWhich "ghc-9.14.1")
 bubblewrap = $(staticWhich "bwrap")
-ghcPkg912 = $(staticWhich "ghc-pkg-9.12.2")
+ghcPkg912 = $(staticWhich "ghc-pkg-9.14.1")
 ghcPkg = $(staticWhich "ghc-pkg")
 
 nixShell = $(staticWhich "nix-shell")
