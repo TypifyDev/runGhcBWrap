@@ -11,12 +11,19 @@ module RunGhcBWrap
   , splitOnNewline
   , splitOnBar
   , RunGhcError(..)
+  , ghcPkg
+  , nixShell
+  , bwrapBaseArgs
+  , bwrapGhcCompile
+  , bwrapGhcLink
+  , bwrapRunBinary
   ) where
 
 import RunGhc.Executable
 import RunGhc.LocatedModule
 import RunGhc.Locate
 import RunGhc.UserInput (RunGhcError(..))
+import RunGhcBWrap.Sandbox (sandboxProcess, bwrapBaseArgs)
 
 import System.Which
 import System.Process as P
@@ -36,9 +43,9 @@ import qualified Data.Text as T
 
 -- runghc = $(staticWhich "runghc")
 -- ghc = $(staticWhich "ghc")
+runghc912, ghc912, ghcPkg912, ghcPkg, nixShell :: FilePath
 runghc912 = $(staticWhich "runghc-9.14.1")
 ghc912 = $(staticWhich "ghc-9.14.1")
-bubblewrap = $(staticWhich "bwrap")
 ghcPkg912 = $(staticWhich "ghc-pkg-9.14.1")
 ghcPkg = $(staticWhich "ghc-pkg")
 
@@ -106,44 +113,24 @@ runHaskellInTimedSandbox timeAllowed inputs =
   timeout timeAllowed $ runHaskellInSandbox inputs
 
 
--- | Common bwrap sandbox arguments
-bwrapBaseArgs :: FilePath -> FilePath -> String -> String -> [String]
-bwrapBaseArgs projectDir tmpBindDir hostPath globalPkgDb =
-  [ "--die-with-parent"
-  , "--bind", projectDir, "/project"
-  , "--bind", tmpBindDir, "/tmp"
-  , "--dev", "/dev"
-  , "--proc", "/proc"
-  , "--ro-bind", "/nix/store", "/nix/store"
-  , "--setenv", "PATH", hostPath
-  , "--setenv", "TMPDIR", "/tmp"
-  , "--setenv", "GHC_PACKAGE_PATH", globalPkgDb
-  , "--chdir", "/project"
-  ]
 
 -- | Compile a single .hs file with ghc -c inside bwrap
 bwrapGhcCompile :: FilePath -> FilePath -> String -> String -> FilePath -> IO (ExitCode, String, String)
-bwrapGhcCompile projectDir tmpBindDir hostPath globalPkgDb hsPath =
-  readCreateProcessWithExitCode
-    (P.proc bubblewrap $ bwrapBaseArgs projectDir tmpBindDir hostPath globalPkgDb
-      ++ [ghc912, "-c", hsPath])
-    ""
+bwrapGhcCompile projectDir tmpBindDir hostPath globalPkgDb hsPath = do
+  command <- sandboxProcess projectDir tmpBindDir hostPath globalPkgDb ghc912 ["-c", hsPath]
+  readCreateProcessWithExitCode command ""
 
 -- | Link .o files into an executable inside bwrap
 bwrapGhcLink :: FilePath -> FilePath -> String -> String -> [FilePath] -> FilePath -> IO (ExitCode, String, String)
-bwrapGhcLink projectDir tmpBindDir hostPath globalPkgDb oFiles outputName =
-  readCreateProcessWithExitCode
-    (P.proc bubblewrap $ bwrapBaseArgs projectDir tmpBindDir hostPath globalPkgDb
-      ++ [ghc912] ++ oFiles ++ ["-o", outputName])
-    ""
+bwrapGhcLink projectDir tmpBindDir hostPath globalPkgDb oFiles outputName = do
+  command <- sandboxProcess projectDir tmpBindDir hostPath globalPkgDb ghc912 (oFiles ++ ["-o", outputName])
+  readCreateProcessWithExitCode command ""
 
 -- | Run a compiled binary inside bwrap
 bwrapRunBinary :: FilePath -> FilePath -> String -> String -> FilePath -> String -> IO (ExitCode, String, String)
-bwrapRunBinary projectDir tmpBindDir hostPath globalPkgDb binaryPath stdinStr =
-  readCreateProcessWithExitCode
-    (P.proc bubblewrap $ bwrapBaseArgs projectDir tmpBindDir hostPath globalPkgDb
-      ++ [binaryPath])
-    stdinStr
+bwrapRunBinary projectDir tmpBindDir hostPath globalPkgDb binaryPath stdinStr = do
+  command <- sandboxProcess projectDir tmpBindDir hostPath globalPkgDb binaryPath []
+  readCreateProcessWithExitCode command stdinStr
 
 runHaskellFilesInSandbox
   :: (Executable, String) -> IO (Either SomeException (ExitCode, String, String))
@@ -168,19 +155,8 @@ runHaskellFilesInSandbox (exe, stdin) = try $ do
     writeLocatedFiles baseDir (_main exe : _library exe)
     print =<< listDirectory projectDir
     hostPath <- getEnv "PATH"
-    let bwrapCmd = P.proc bubblewrap $
-          [ "--die-with-parent"
-          , "--bind", projectDir, "/project"
-          , "--bind", tmpBindDir, "/tmp"
-          , "--dev", "/dev"
-          , "--proc", "/proc"
-          , "--ro-bind", "/nix/store", "/nix/store"
-          , "--setenv", "PATH", hostPath
-          , "--setenv", "TMPDIR", "/tmp"
-          , "--setenv", "GHC_PACKAGE_PATH", globalPkgDb
-          , "--chdir", "/project"
-          , runghc912, "-f", ghc912, expectedMainFile
-          ] <> words stdin
+    bwrapCmd <- sandboxProcess projectDir tmpBindDir hostPath globalPkgDb
+      runghc912 (["-f", ghc912, expectedMainFile] <> words stdin)
     readCreateProcessWithExitCode bwrapCmd ""
 
 -- | Run a SandboxedExecutable with two-phase compilation to prevent
@@ -220,18 +196,7 @@ runSandboxedExecutable (sandboxed, stdinStr) = try $ runExceptT $ do
     let baseDir = projectDir
     hostPath <- liftIO $ getEnv "PATH"
 
-    let sandboxArgs =
-          [ "--die-with-parent"
-          , "--bind", projectDir, "/project"
-          , "--bind", tmpBindDir, "/tmp"
-          , "--dev", "/dev"
-          , "--proc", "/proc"
-          , "--ro-bind", "/nix/store", "/nix/store"
-          , "--setenv", "PATH", hostPath
-          , "--setenv", "TMPDIR", "/tmp"
-          , "--setenv", "GHC_PACKAGE_PATH", ghcPackagePath
-          , "--chdir", "/project"
-          ]
+    let sandboxCommand = sandboxProcess projectDir tmpBindDir hostPath ghcPackagePath
 
     -- Create directory structure for all modules upfront
     liftIO $ forM_ allFolders $ \fldr ->
@@ -245,8 +210,8 @@ runSandboxedExecutable (sandboxed, stdinStr) = try $ runExceptT $ do
     liftIO $ writeLocatedFiles baseDir untrusted
     forM_ untrusted $ \m -> do
       let hsPath = pathSegsToPath ".hs" (getPathSegments m)
-      (ec, _, err) <- liftIO $ readCreateProcessWithExitCode
-        (P.proc bubblewrap $ sandboxArgs ++ [ghc912, "-c", hsPath]) ""
+      command <- liftIO $ sandboxCommand ghc912 ["-c", hsPath]
+      (ec, _, err) <- liftIO $ readCreateProcessWithExitCode command ""
       when (ec /= ExitSuccess) $
         throwE $ Stage1Error_ReadUntrusted $ T.pack err
         -- T.pack $ "Phase 1 compilation failed for " ++ hsPath ++ ": " ++ err
@@ -261,8 +226,8 @@ runSandboxedExecutable (sandboxed, stdinStr) = try $ runExceptT $ do
     -- and links with the correct package libraries since it reads
     -- package deps from .hi files.
     let mainHsPath = pathSegsToPath ".hs" (getPathSegments (_main exe))
-    (ec, _, err) <- liftIO $ readCreateProcessWithExitCode
-      (P.proc bubblewrap $ sandboxArgs ++ [ghc912, "--make", mainHsPath, "-o", "Main"]) ""
+    command <- liftIO $ sandboxCommand ghc912 ["--make", mainHsPath, "-o", "Main"]
+    (ec, _, err) <- liftIO $ readCreateProcessWithExitCode command ""
     when (ec /= ExitSuccess) $
       throwE $ Stage2Error_Link $ T.pack err
 
@@ -271,8 +236,8 @@ runSandboxedExecutable (sandboxed, stdinStr) = try $ runExceptT $ do
       removeFile (baseDir </> pathSegsToPath ".hs" (getPathSegments m))
 
     -- Phase 4: Run the binary
-    liftIO $ readCreateProcessWithExitCode
-      (P.proc bubblewrap $ sandboxArgs ++ ["./Main"]) stdinStr
+    runtime <- liftIO $ sandboxCommand "./Main" []
+    liftIO $ readCreateProcessWithExitCode runtime stdinStr
 
 
 
@@ -322,16 +287,6 @@ runHaskellInSandbox (sourceCode, stdin) = try $ do
     let hsFile = projectDir </> "src" </> "Main.hs"
     writeFile hsFile sourceCode
     hostPath <- getEnv "PATH"
-    let bwrapCmd = P.proc bubblewrap $
-          [ "--bind", projectDir, "/project"
-          , "--bind", tmpBindDir, "/tmp"
-          , "--dev", "/dev"
-          , "--proc", "/proc"
-          , "--ro-bind", "/nix/store", "/nix/store"
-          , "--setenv", "PATH", hostPath
-          , "--setenv", "TMPDIR", "/tmp"
-          , "--setenv", "GHC_PACKAGE_PATH", globalPkgDb
-          , "--chdir", "/project"
-          , runghc912, "-f", ghc912, "src/Main.hs"
-          ] <> words stdin
+    bwrapCmd <- sandboxProcess projectDir tmpBindDir hostPath globalPkgDb
+      runghc912 (["-f", ghc912, "src/Main.hs"] <> words stdin)
     readCreateProcessWithExitCode bwrapCmd ""

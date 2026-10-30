@@ -12,7 +12,11 @@ import RunGhc.Locate
 import RunGhc.SystemModule
 
 import System.Exit (ExitCode(..))
+import System.Directory (doesFileExist)
+import System.FilePath ((</>))
+import System.IO.Temp (withSystemTempDirectory)
 import Data.List (isInfixOf)
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Text as T
 
 main :: IO ()
@@ -37,21 +41,51 @@ tests = testGroup "runGhcBWrap"
       ]
   , testGroup "runHaskellInSandbox"
       [ testCase "simple hello world" testSimpleHelloWorld
+      , testCase "cannot read a host file outside the job" testHostReadDenied
+      , testCase "cannot write a host file outside the job" testHostWriteDenied
       ]
   ]
+
+-- Exercise the public runner; a compiler/startup failure must not count as denial.
+testHostReadDenied :: Assertion
+testHostReadDenied = withSystemTempDirectory "runner-host-fixture" $ \directory -> do
+  let path = directory </> "private.txt"
+  writeFile path "host-only-sentinel"
+  assertDeniedOperation ("readFile " ++ show path ++ " >>= putStrLn")
+
+testHostWriteDenied :: Assertion
+testHostWriteDenied = withSystemTempDirectory "runner-host-fixture" $ \directory -> do
+  let path = directory </> "unexpected.txt"
+  assertDeniedOperation ("writeFile " ++ show path ++ " \"unexpected\"")
+  exists <- doesFileExist path
+  assertBool "sandbox must not create the host file" (not exists)
+
+assertDeniedOperation :: String -> Assertion
+assertDeniedOperation operation = do
+  result <- runHaskellInSandbox (unlines
+    [ "module Main where", "import System.IO.Error (tryIOError)"
+    , "main :: IO ()", "main = do"
+    , "  result <- tryIOError (" ++ operation ++ ")"
+    , "  putStrLn (either (const \"DENIED\") (const \"ALLOWED\") result)"
+    ], "")
+  case result of
+    Left exception -> assertFailure (show exception)
+    Right (status, output, diagnostic) -> do
+      assertEqual diagnostic ExitSuccess status
+      output @?= "DENIED\n"
 
 -- Helper: create a user-submitted module (untrusted)
 mkUserModule :: [String] -> String -> LocatedModule
 mkUserModule pathSegs source =
   FromLocatedScript $ LocatedScript
-    (map (PathSegment . T.pack) pathSegs)
+    (NE.map (PathSegment . T.pack) (NE.fromList pathSegs))
     (Script (T.pack source))
 
 -- Helper: create a system-generated module (trusted)
 mkSystemModule :: [String] -> String -> LocatedModule
 mkSystemModule pathSegs expr =
   FromSystemModule
-    (map (PathSegment . T.pack) pathSegs)
+    (NE.map (PathSegment . T.pack) (NE.fromList pathSegs))
     (ExpressionsOnly (Expressions (T.pack expr)))
 
 -- Helper: create Main module (system-generated)

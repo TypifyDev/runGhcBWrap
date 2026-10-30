@@ -27,6 +27,8 @@ library
     , runGhcBWrap-core
   exposed-modules:
         RunGhcBWrap
+  other-modules:
+        RunGhcBWrap.Sandbox
 
 test-suite tests
   type: exitcode-stdio-1.0
@@ -47,5 +49,8 @@ test-suite tests
     , runGhcBWrap-core
     , tasty
     , tasty-hunit
+    , directory
+    , filepath
+    , temporary
     , text
     , transformers
